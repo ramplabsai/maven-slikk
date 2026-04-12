@@ -2,20 +2,27 @@ import os
 import time
 import json
 import asyncio
-import configparser
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from google import genai
 from google.genai import types
 from google.cloud import bigquery
+import vertexai
+from vertexai.vision_models import MultiModalEmbeddingModel
 
 # --- 1. Configuration & Global Clients ---
 PROJECT_ID = os.environ.get("GCP_PROJECT_ID", "maven-search-493109")
 REGION = os.environ.get("GCP_REGION", "us-central1")
 BQ_TABLE = f"{PROJECT_ID}.slikk_data.maven_final_vector_search"
 
-# Initialize Clients
-client = genai.Client(vertexai=True, project=PROJECT_ID, location=REGION)
+# Initialize Vertex AI for Multimodal Vectors (Stable SDK)
+vertexai.init(project=PROJECT_ID, location=REGION)
+mm_model = MultiModalEmbeddingModel.from_pretrained("multimodalembedding@001")
+
+# Initialize GenAI for Gemini Parsing (Experimental SDK)
+genai_client = genai.Client(vertexai=True, project=PROJECT_ID, location=REGION)
+
+# Initialize BigQuery
 bq_client = bigquery.Client(project=PROJECT_ID)
 
 # --- 2. Constants & Mapping ---
@@ -52,8 +59,7 @@ async def async_parse_user_query(raw_query: str):
     Return ONLY raw JSON with keys: corrected_query, color, product_type, gender, division, brand, price_min, price_max.
     """
     try:
-        # Note: In the genai SDK, we use models.generate_content
-        response = client.models.generate_content(
+        response = genai_client.models.generate_content(
             model="gemini-1.5-flash",
             contents=prompt,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.0)
@@ -63,15 +69,14 @@ async def async_parse_user_query(raw_query: str):
         print(f"Parsing Failed: {e}")
         return {"corrected_query": raw_query, "color": None, "gender": None, "brand": None}
 
-# --- ASYNC TASK 2: VECTOR GENERATION ---
+# --- ASYNC TASK 2: VECTOR GENERATION (VERIFIED 1408 FIX) ---
 async def async_get_embedding(text: str):
-    # We wrap the text in a Content object to ensure the SDK sends it correctly
-    response = client.models.embed_content(
-        model="multimodalembedding@001",
-        contents=types.Content(parts=[types.Part(text=text)])
+    # Using the vertexai logic that worked in our Jupyter test
+    embeddings = mm_model.get_embeddings(
+        contextual_text=text,
+        dimension=1408
     )
-    # Extract the vector values
-    return [float(x) for x in response.embeddings[0].values]
+    return [float(x) for x in embeddings.text_embedding]
 
 # --- THE SEARCH ENDPOINT ---
 @app.get("/search")
@@ -83,7 +88,7 @@ async def search_catalogue(query: str, page: int = 1, page_size: int = 12):
         raise HTTPException(status_code=400, detail="Query cannot be empty")
 
     try:
-        # Parallel Execution
+        # Parallel Execution: Parse filters and generate vector at the same time
         parsed_filters, query_vector = await asyncio.gather(
             async_parse_user_query(query), 
             async_get_embedding(query)
@@ -97,17 +102,20 @@ async def search_catalogue(query: str, page: int = 1, page_size: int = 12):
             bigquery.ScalarQueryParameter("offset", "INT64", offset),
         ]
 
+        # Gender/Division Filtering
         if parsed_filters.get("gender") and parsed_filters["gender"].lower() in GENDER_MAP:
             allowed_divs = GENDER_MAP[parsed_filters["gender"].lower()]
             where_clauses.append("LOWER(`Division Name`) IN UNNEST(@filter_divisions)")
             query_params.append(bigquery.ArrayQueryParameter("filter_divisions", "STRING", [d.lower() for d in allowed_divs]))
         
+        # Color Filtering
         if parsed_filters.get("color"):
             where_clauses.append("LOWER(color) LIKE @color")
             query_params.append(bigquery.ScalarQueryParameter("color", "STRING", f"%{parsed_filters['color'].lower()}%"))
 
         where_sql = " AND ".join(where_clauses)
 
+        # BigQuery Vector Search
         sql_query = f"""
             SELECT 
                 skid, `Product Name`, `Brand Name`, `Division Name`,
@@ -127,6 +135,7 @@ async def search_catalogue(query: str, page: int = 1, page_size: int = 12):
         query_job = bq_client.query(sql_query, job_config=job_config)
         rows = list(query_job.result())
 
+        # Formatting results
         results = []
         for row in rows[:page_size]:
             results.append({
@@ -140,6 +149,7 @@ async def search_catalogue(query: str, page: int = 1, page_size: int = 12):
 
         return {
             "query": query,
+            "parsed_metadata": parsed_filters,
             "query_time_ms": int((time.time() - start_time) * 1000),
             "pagination": {"current_page": page, "has_next_page": len(rows) > page_size},
             "results": results
