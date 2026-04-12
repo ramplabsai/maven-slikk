@@ -65,11 +65,12 @@ async def async_parse_user_query(raw_query: str):
 
 # --- ASYNC TASK 2: VECTOR GENERATION ---
 async def async_get_embedding(text: str):
-    # Ensure text is passed in a list or as a 'content' object
+    # We wrap the text in a Content object to ensure the SDK sends it correctly
     response = client.models.embed_content(
         model="multimodalembedding@001",
-        contents=types.Content(parts=[types.Part(text=text)]) # This is the safest way
+        contents=types.Content(parts=[types.Part(text=text)])
     )
+    # Extract the vector values
     return [float(x) for x in response.embeddings[0].values]
 
 # --- THE SEARCH ENDPOINT ---
