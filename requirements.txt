@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+google-cloud-bigquery
+google-cloud-aiplatform
+google-genai
+pandas
+python-multipart
+db-dtypes
