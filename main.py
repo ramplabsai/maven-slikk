@@ -110,6 +110,8 @@ async def search(query: str, page: int = 1, page_size: int = 12):
             LIMIT @limit OFFSET @offset
         """
 
+        print(sql_query)
+
         job_config = bigquery.QueryJobConfig(query_parameters=query_params)
         query_job = bq_client.query(sql_query, job_config=job_config)
         rows = list(query_job.result())
